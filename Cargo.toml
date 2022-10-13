@@ -13,3 +13,5 @@ edition = "2021"
     tokio = { version = "1", features = ["full"] }
     log = "0.4"
     env_logger = "0.9"
+    septem = "1.1.0"
+    itertools = "0.10"

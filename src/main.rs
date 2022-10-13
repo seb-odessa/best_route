@@ -1,9 +1,11 @@
+use itertools::Itertools;
 use log::{debug, info, warn};
+use septem::Roman;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 
 const ROOT: &str = "https://esi.evetech.net/latest";
 const PARAM: &str = "?datasource=tranquility&language=en";
@@ -116,13 +118,20 @@ struct Belt {
     id: i32,
     name: String,
     position: Position,
+    cloud_number: u32,
+    belt_number: u32,
 }
 impl Belt {
     pub fn new(id: &i32, name: &String, position: &Position) -> Self {
+        let tokens = name.trim().split_whitespace().collect::<Vec<&str>>();
+        assert_eq!(6, tokens.len());
+
         Self {
             id: id.clone(),
             name: name.clone(),
             position: position.clone(),
+            cloud_number: *tokens[1].parse::<Roman>().unwrap(),
+            belt_number: tokens[5].parse::<u32>().unwrap(),
         }
     }
 }
@@ -137,6 +146,14 @@ impl Cloud {
         Self {
             belts: HashMap::new(),
             distances: HashMap::new(),
+        }
+    }
+
+    pub fn get_name(&self, id: &i32) -> Option<String> {
+        if let Some(belt) = self.belts.get(id) {
+            Some(belt.name.clone())
+        } else {
+            None
         }
     }
 
@@ -163,11 +180,55 @@ impl Cloud {
         }
     }
 
-    fn distance_between(&self, a: &i32, b: &i32) -> Option<f64> {
+    pub fn distance_between(&self, a: &i32, b: &i32) -> Option<f64> {
         if let Some(ref value) = self.distances.get(a) {
             return value.get(b).cloned();
         }
         return None;
+    }
+
+    fn route_distance(&self, route: &Vec<&i32>) -> f64 {
+        let mut distance = 0.0;
+        route.iter().reduce(|a, b| {
+            distance += self.distance_between(&a, &b).unwrap_or(0.0);
+            return b;
+        });
+        return distance;
+    }
+
+    pub fn route(&self) -> (f64, Vec<i32>) {
+        if self.belts.is_empty() {
+            return (0.0, vec![]);
+        } else {
+            let points = self.belts.keys().cloned().collect();
+            return self.brute_force(&points);
+        }
+    }
+
+    fn brute_force(&self, points: &Vec<i32>) -> (f64, Vec<i32>) {
+        if points.is_empty() {
+            return (0.0, vec![]);
+        } else if 1 == points.len() {
+            return (0.0, points.clone());
+        } else if 2 == points.len() {
+            let refs = points.iter().collect::<Vec<&i32>>();
+            return (self.route_distance(&refs), points.clone());
+        } else {
+            let mut minimal = f64::MAX;
+            let mut route = Vec::new();
+            for permutation in points.iter().permutations(points.len()).unique() {
+                let distance = self.route_distance(&permutation);
+                if distance < minimal {
+                    minimal = distance;
+                    route = permutation.into_iter().cloned().collect();
+                }
+            }
+            if !route.is_empty() {
+                return (minimal, route);
+            }
+        }
+
+        return (0.0, vec![]);
     }
 }
 
@@ -181,13 +242,53 @@ mod tests {
         let mut cloud = Cloud::new();
         assert_eq!(cloud.distance_between(&0, &1), None);
 
-        cloud.add(&0, &String::from(" 0 "), &Position::new(&0.0, &0.0, &0.0));
-        cloud.add(&1, &String::from(" 1 "), &Position::new(&1.0, &0.0, &0.0));
+        cloud.add(
+            &1,
+            &String::from("System I - Asteroid Belt 1"),
+            &Position::new(&0.0, &0.0, &0.0),
+        );
+        cloud.add(
+            &2,
+            &String::from("System I - Asteroid Belt 2"),
+            &Position::new(&1.0, &0.0, &0.0),
+        );
 
-        assert_eq!(cloud.distance_between(&0, &1), Some(1.0));
-        assert_eq!(cloud.distance_between(&1, &0), Some(1.0));
+        assert_eq!(cloud.distance_between(&1, &2), Some(1.0));
+        assert_eq!(cloud.distance_between(&2, &1), Some(1.0));
+    }
 
-        //assert_eq!(add(1, 2), 3);
+    #[test]
+    fn test_cloud_route() {
+        let mut cloud = Cloud::new();
+        assert_eq!((0.0, vec![]), cloud.route());
+
+        cloud.add(
+            &1,
+            &String::from("System I - Asteroid Belt 1"),
+            &Position::new(&0.0, &0.0, &0.0),
+        );
+        assert_eq!((0.0, vec![1]), cloud.route());
+
+        cloud.add(
+            &2,
+            &String::from("System I - Asteroid Belt 2"),
+            &Position::new(&1.0, &0.0, &0.0),
+        );
+        assert_eq!(1.0, cloud.route().0);
+
+        cloud.add(
+            &3,
+            &String::from("System I - Asteroid Belt 3"),
+            &Position::new(&2.0, &0.0, &0.0),
+        );
+        assert_eq!(2.0, cloud.route().0);
+
+        cloud.add(
+            &4,
+            &String::from("System I - Asteroid Belt 4"),
+            &Position::new(&3.0, &0.0, &0.0),
+        );
+        assert_eq!(3.0, cloud.route().0);
     }
 }
 
@@ -199,7 +300,7 @@ async fn load_system_asteroids(system: &System) -> anyhow::Result<Vec<Cloud>> {
             if let Some(ref ids) = planet.asteroid_belts {
                 for id in ids {
                     let belt = AsteroidBelt::load(id).await?;
-                    info!("Belt: {id} - {}: {}", belt.name, belt.position);
+                    println!("Belt: {id} - {}: {}", belt.name, belt.position);
                     cloud.add(id, &belt.name, &belt.position);
                 }
             }
@@ -223,16 +324,21 @@ async fn run(id: &i32) -> anyhow::Result<()> {
     info!("Belt clouds: {}", clouds.len());
 
     for cloud in &clouds {
-        let mut belts = cloud.belts.values().cloned().collect::<Vec<_>>();
-        belts.sort_by(|x, y| x.name.cmp(&y.name));
-        let mut total = 0.0;
-        let mut sorted_belts = belts.into_iter();
+        let mut belts = cloud.belts.values().cloned().collect::<Vec<Belt>>();
+        belts.sort_by(|a, b| {
+            if a.cloud_number == b.cloud_number {
+                a.belt_number.cmp(&b.belt_number)
+            } else {
+                a.cloud_number.cmp(&b.cloud_number)
+            }
+        });
 
-        if let Some(first_belt) = sorted_belts.next() {
-            let mut last_belt = first_belt.clone();
+        let mut total_in_cloud = 0.0;
+        let mut sorted_belts = belts.into_iter();
+        if let Some(mut last_belt) = sorted_belts.next() {
             while let Some(belt) = sorted_belts.next() {
                 if let Some(dist) = cloud.distance_between(&last_belt.id, &belt.id) {
-                    total += dist;
+                    total_in_cloud += dist;
                     info!(
                         "Distance between `{}` and `{}` is {}",
                         last_belt.name,
@@ -242,20 +348,36 @@ async fn run(id: &i32) -> anyhow::Result<()> {
                 }
                 last_belt = belt;
             }
-            let dist = Position::distance(&last_belt.position, &first_belt.position);
-            total += dist;
-            if 0.0 < total {
-                info!(
-                    "Distance between `{}` and `{}` is {}",
-                    last_belt.name,
-                    first_belt.name,
-                    fmt(&dist)
-                );
-            }
         }
 
-        if 0.0 < total {
-            info!("The total route distance is {} million Km.", fmt(&total));
+        if 2 < cloud.belts.len() {
+            info!(
+                "The length of the sequential route: {}",
+                fmt(&total_in_cloud)
+            );
+        }
+
+        let (minimum, route) = cloud.route();
+
+        if 1 == route.len() {
+            let id = route[0];
+            let name = cloud.get_name(&id).unwrap_or_default();
+            println!("Warp to `{name}`");
+        } else {
+            let mut first_time = true;
+            route.iter().reduce(|a, b| {
+                let dist = cloud.distance_between(&a, &b).unwrap_or(0.0);
+                let name_a = cloud.get_name(a).unwrap_or_default();
+                let name_b = cloud.get_name(b).unwrap_or_default();
+                if first_time {
+                    println!("Warp to `{name_a}`");
+                    first_time = false;
+                }
+
+                println!("Warp to `{name_b}` ({})", fmt(&dist));
+                return b;
+            });
+            info!("The length of the optimal route: {}", fmt(&minimum));
         }
     }
     Ok(())
@@ -263,7 +385,7 @@ async fn run(id: &i32) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("warn"));
     let args: Vec<String> = env::args().collect();
 
     if let Some((cmd, names_ref)) = args.split_first() {
